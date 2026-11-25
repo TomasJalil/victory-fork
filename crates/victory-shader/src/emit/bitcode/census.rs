@@ -112,6 +112,35 @@ fn kind(name: &str) -> usize {
     }
 }
 
+#[cfg(test)]
+impl Module {
+    /// Per block reached from the entry (by number, empty for the others):
+    /// the functions its body calls, `dx.op.` left off. For tests of what
+    /// the lowering emits.
+    pub(crate) fn calls(&self) -> Vec<Vec<String>> {
+        let reached = self.reached();
+        self.blocks
+            .iter()
+            .enumerate()
+            .map(|(b, blk)| {
+                if !reached[b] {
+                    return Vec::new();
+                }
+                blk.body
+                    .iter()
+                    .filter_map(|&i| match &self.insts[i as usize].op {
+                        Op::Call(f, _) => {
+                            let name = &self.funcs[*f as usize].name;
+                            Some(name.strip_prefix("dx.op.").unwrap_or(name).to_string())
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+}
+
 impl Module {
     /// The instructions [`Module::write`] writes, by kind.
     pub(crate) fn census(&self) -> Census {

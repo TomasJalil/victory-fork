@@ -65,6 +65,10 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Per block, the calls the lowering emitted (before the clean-up;
+    /// `Module::calls`).
+    #[cfg(test)]
+    pub calls: Vec<Vec<String>>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -2124,6 +2128,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            calls: self.s.m.calls(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -2629,7 +2635,21 @@ impl<'a> Lower<'a> {
     /// it and the byte in that view. A page without a copy reads zeros
     /// (and drops writes) through the null view at the first slot, and its
     /// number is left for the host, for lanes that run (`guard`).
-    fn memory(&mut self, lo: V, hi: V, guard: Option<V>) -> (V, V) {
+    ///
+    /// With `branch` only those lanes store the number, behind a branch:
+    /// the handle and the byte are made before it, and the code goes on in
+    /// the block after it (`self.cur` changes; a caller emits there).
+    /// Without, every lane stores, the others at the sink (dword 0, which
+    /// the host never reads), and `self.cur` stays.
+    fn memory(&mut self, lo: V, hi: V, guard: Option<V>, branch: bool) -> (V, V) {
+        let (slot, byte) = self.memory_slot(lo, hi, guard, branch);
+        let h = self.s.heap_handle(self.cur, slot, false, true, (11 | 0x1000, 0));
+        (h, byte)
+    }
+
+    /// [`Self::memory`] with the view-heap slot of the copy's view for the
+    /// handle (made in the block `self.cur` is in on return).
+    fn memory_slot(&mut self, lo: V, hi: V, guard: Option<V>, branch: bool) -> (V, V) {
         use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
         let c = self.cur;
         let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
@@ -2667,31 +2687,37 @@ impl<'a> Lower<'a> {
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);
         }
-        let places = k(self, MEMORY_FAULTS - 1);
-        let place = self.s.m.bin(c, Bin::URem, page, places);
-        let one = k(self, 1);
-        let place = self.s.m.bin(c, Bin::Add, place, one);
-        let k2 = k(self, 2);
-        let place = self.s.m.bin(c, Bin::Shl, place, k2);
-        let place = self.s.m.select(c, missing, place, zero);
+        let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
+        let slot = self.s.m.bin(c, Bin::Add, base, copy);
+        let k64k = k(self, 0xFFFF);
+        let within = self.s.m.bin(c, Bin::And, lo, k64k);
+        let byte = self.s.m.bin(c, Bin::Add, start, within);
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
+        let at = if branch { self.begin_guarded(Some(missing)) } else { None };
+        // (inside the branch when there is one: only lanes that store pay
+        // for the place)
+        let d = self.cur;
+        let places = k(self, MEMORY_FAULTS - 1);
+        let place = self.s.m.bin(d, Bin::URem, page, places);
+        let one = k(self, 1);
+        let place = self.s.m.bin(d, Bin::Add, place, one);
+        let k2 = k(self, 2);
+        let mut place = self.s.m.bin(d, Bin::Shl, place, k2);
+        if !branch {
+            place = self.s.m.select(d, missing, place, zero);
+        }
         let void = self.s.t.void;
         let mask = self.s.m.i8(1);
         self.s.op(
-            c,
+            d,
             "rawBufferStore.i32",
             Attr::NoUnwind,
             void,
             140,
             &[faults, place, iu, page, iu, iu, iu, mask, align],
         );
-        let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
-        let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
-        let k64k = k(self, 0xFFFF);
-        let within = self.s.m.bin(c, Bin::And, lo, k64k);
-        let byte = self.s.m.bin(c, Bin::Add, start, within);
-        (h, byte)
+        self.end_guarded(at, &[]);
+        (slot, byte)
     }
 
     /// `global_load_*`, `global_store_*` and `global_atomic_*` on title
@@ -2723,7 +2749,6 @@ impl<'a> Lower<'a> {
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
         let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
         let guard = self.guard(b, i)?;
-        let c = self.cur;
         let (i32t, res, void) = (self.s.t.i32, self.s.t.res_ret, self.s.t.void);
         let iu = self.s.m.undef(i32t);
         let align = self.s.m.i32(4);
@@ -2735,12 +2760,15 @@ impl<'a> Lower<'a> {
             "dwordx4" => Ok(4),
             _ => Err(name),
         };
+        // `memory` ends in the block after its branch: what follows it is
+        // emitted there.
         if let Some(rest) = name.strip_prefix("global_load_") {
             let n = count(rest)?;
             let Some(Operand::Vector { reg, .. }) = *dst else {
                 return Err("a global load result");
             };
-            let (h, byte) = self.memory(lo, hi, guard);
+            let (h, byte) = self.memory(lo, hi, guard, true);
+            let c = self.cur;
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,
@@ -2761,7 +2789,7 @@ impl<'a> Lower<'a> {
             let n = count(rest)?;
             let d = data.as_ref().ok_or("global store data")?;
             let vals = self.vgprs(inst, d, n)?;
-            let (h, byte) = self.memory(lo, hi, guard);
+            let (h, byte) = self.memory(lo, hi, guard, true);
             let mut args = vec![h, byte, iu];
             args.extend(&vals);
             args.resize(3 + 4, iu);
@@ -2788,7 +2816,8 @@ impl<'a> Lower<'a> {
             Some(x) => self.i32_of(x)?,
             None => self.s.m.i32(0),
         };
-        let (h, byte) = self.memory(lo, hi, guard);
+        let (h, byte) = self.memory(lo, hi, guard, true);
+        let c = self.cur;
         // DXIL's atomic operations: add 0, and 1, or 2, xor 3, signed
         // minimum 4 and maximum 5, unsigned 6 and 7, exchange 8.
         let simple = match op {
@@ -2919,10 +2948,44 @@ impl<'a> Lower<'a> {
             lo = sum;
         }
         let (iu, align) = (self.s.m.undef(i32t), self.s.m.i32(4));
+        // Four dwords at a time. The first four and the last four look their
+        // pages up (`memory` ends in the block after its branch: what follows
+        // is emitted there). The load spans less than a page, so it crosses
+        // at most one page boundary, and the fours between lie in the first
+        // one's page while their byte in it stays below 64 KiB, else in the
+        // last one's: the same copy and byte their own look-up would give.
+        let last = (count - 1) / 4 * 4;
+        let (lo0, hi0) = self.address_plus(lo, hi, offset);
+        let head = self.memory_slot(lo0, hi0, None, true);
+        let tail = if last > 0 {
+            let (lo1, hi1) = self.address_plus(lo, hi, offset + 4 * i32::from(last));
+            Some(self.memory_slot(lo1, hi1, None, true))
+        } else {
+            None
+        };
         for first in (0..count).step_by(4) {
             let n = (count - first).min(4);
-            let (lo, hi) = self.address_plus(lo, hi, offset + 4 * i32::from(first));
-            let (h, byte) = self.memory(lo, hi, None);
+            let c = self.cur;
+            let (slot, byte) = match tail {
+                None => head,
+                Some(_) if first == 0 => head,
+                Some(t) if first == last => t,
+                Some((slot1, byte1)) => {
+                    let (slot0, byte0) = head;
+                    let (ahead, behind) = (4 * u32::from(first), 4 * u32::from(last - first));
+                    let k64k = self.s.m.i32(0xFFFF);
+                    let within = self.s.m.bin(c, Bin::And, lo0, k64k);
+                    let room = self.s.m.i32(0x1_0000 - ahead);
+                    let same = self.s.m.cmp(c, pred::IULT, within, room);
+                    let ka = self.s.m.i32(ahead);
+                    let b0 = self.s.m.bin(c, Bin::Add, byte0, ka);
+                    let kb = self.s.m.i32(behind);
+                    let b1 = self.s.m.bin(c, Bin::Sub, byte1, kb);
+                    let slot = self.s.m.select(c, same, slot0, slot1);
+                    (slot, self.s.m.select(c, same, b0, b1))
+                }
+            };
+            let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
             let mask = self.s.m.i8((1u8 << n) - 1);
             let r = self.s.op(
                 c,
@@ -11353,5 +11416,87 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    /// Calls named `prefix...` in `calls` (`Lowered::calls`), with their blocks.
+    fn calls_of<'c>(calls: &'c [Vec<String>], prefix: &str) -> Vec<(usize, &'c [String])> {
+        calls
+            .iter()
+            .enumerate()
+            .flat_map(|(b, blk)| {
+                blk.iter()
+                    .filter(move |c| c.starts_with(prefix))
+                    .map(move |_| (b, blk.as_slice()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_scalar_load_by_address_looks_up_its_first_and_last_pages_only() {
+        // s[0:1] are root constants: an address as it stands, title memory.
+        let words = [
+            0xF410_0200,
+            0xFA00_0000, // s_load_dwordx16 s[8:23], s[0:1], null
+            0x7E02_0217, // v_mov_b32 v1, s23
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Constants, 0, 0), root(RootType::Constants, 1, 1)];
+        let l = lower_with(&words, layout, vec![]).unwrap();
+        // Two directory entries read (the first four dwords' page and the
+        // last four's; the middle eight pick between them), four loads.
+        assert_eq!(calls_of(&l.calls, "rawBufferLoad").len(), 2 + 4);
+        // A page without a copy is noted by the lanes that found it alone,
+        // in a block of its own; nothing else goes there.
+        let stores = calls_of(&l.calls, "rawBufferStore");
+        assert_eq!(stores.len(), 2);
+        for (b, blk) in stores {
+            assert_eq!(blk.len(), 1, "block {b}: {blk:?}");
+        }
+        assert!(l.root_uavs.contains(&super::super::SLOT_FAULTS));
+        assert!(l.root_srvs.contains(&super::super::SLOT_MEMORY));
+    }
+
+    #[test]
+    fn smaller_scalar_loads_by_address_look_up_each_page_once() {
+        // x4: one look-up; x8: the first four's and the last four's.
+        for (word, lookups) in [(0xF408_0200u32, 1usize), (0xF40C_0200, 2)] {
+            let words = [
+                word,
+                0xFA00_0000, // s_load_dwordx4 / x8 s[8:..], s[0:1], null
+                0x7E02_0208, // v_mov_b32 v1, s8
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ];
+            let layout = vec![root(RootType::Constants, 0, 0), root(RootType::Constants, 1, 1)];
+            let l = lower_with(&words, layout, vec![]).unwrap();
+            assert_eq!(calls_of(&l.calls, "rawBufferStore").len(), lookups);
+            assert_eq!(calls_of(&l.calls, "rawBufferLoad").len(), 2 * lookups);
+        }
+    }
+
+    #[test]
+    fn a_global_load_by_address_notes_a_missing_page_behind_a_branch() {
+        let words = [
+            0x7E02_0200, // v_mov_b32 v1, s0
+            0x7E04_0201, // v_mov_b32 v2, s1
+            0xDC30_8000,
+            0x037D_0001, // global_load_dword v3, v[1:2], off
+            0xD834_0000,
+            0x0000_0300, // ds_write_b32 v0, v3
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Constants, 0, 0), root(RootType::Constants, 1, 1)];
+        let l = lower_with(&words, layout, vec![]).unwrap();
+        let loads = calls_of(&l.calls, "rawBufferLoad");
+        assert_eq!(loads.len(), 2, "the directory entry, the dword");
+        let stores = calls_of(&l.calls, "rawBufferStore");
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].1.len(), 1, "{:?}", stores[0].1);
+        // The dword is read after the branch, in the block it joins.
+        assert_ne!(loads[0].0, loads[1].0);
+        assert_ne!(stores[0].0, loads[1].0);
     }
 }
