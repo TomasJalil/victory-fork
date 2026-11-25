@@ -2701,7 +2701,7 @@ impl<'a> Lower<'a> {
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
         let faults = self.s.root_uav_handle(SLOT_FAULTS);
-        let at = if branch { self.begin_guarded(Some(missing)) } else { None };
+        let noted = if branch { self.begin_guarded(Some(missing)) } else { None };
         // (inside the branch when there is one: only lanes that store pay
         // for the place)
         let d = self.cur;
@@ -2724,7 +2724,7 @@ impl<'a> Lower<'a> {
             140,
             &[faults, place, iu, page, iu, iu, iu, mask, align],
         );
-        self.end_guarded(at, &[]);
+        self.end_guarded(noted, &[]);
         (slot, byte)
     }
 
