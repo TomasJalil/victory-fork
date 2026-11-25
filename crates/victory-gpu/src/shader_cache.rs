@@ -38,8 +38,8 @@ pub(crate) fn counts() -> (u64, u64) {
 }
 
 /// What identifies this build: the BLAKE3 of our executable file and of
-/// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// the translation settings it runs with (the loop limit and its hit
+/// counter, which a diagnostics build can change at run time).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -75,6 +75,12 @@ fn build() -> &'static [u8; 32] {
                 }
                 // And which clean-up passes ran over the translated code.
                 bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+                // And whether loops count the lanes the limit stops (only
+                // when on: the entries of runs without it stay good).
+                if victory_shader::emit::loop_hits() {
+                    tracing::warn!("VICTORY_LOOP_HITS: translated loops count the lanes the limit stops");
+                    bytes.extend_from_slice(b"VICTORY_LOOP_HITS=1");
+                }
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

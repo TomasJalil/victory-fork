@@ -51,6 +51,10 @@ pub const SLOT_FAULTS: u8 = 253;
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// With [`super::loop_hits`]: the root UAV `u<SLOT_LOOP_HITS>` in
+/// [`ROOT_CBV_SPACE`] whose dword 0 counts the lanes a translated loop
+/// stopped at the loop limit. The host binds each shader its own dword.
+pub const SLOT_LOOP_HITS: u8 = 252;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;

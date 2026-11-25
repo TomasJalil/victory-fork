@@ -1039,6 +1039,23 @@ impl State {
                     }
                     continue;
                 }
+                if slot == victory_shader::emit::SLOT_LOOP_HITS {
+                    // Ours: where its loops count the lanes the limit stops.
+                    let Some(gpu) = crate::loop_hits::address(list, &stage.shader) else {
+                        once!("no buffer for the loop limit hit counts: the draw is dropped");
+                        return false;
+                    };
+                    // SAFETY: an open list; the buffer lives as long as the
+                    // process and the list holds it.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootUnorderedAccessView(param, gpu);
+                        } else {
+                            l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                        }
+                    }
+                    continue;
+                }
                 let address = match self.roots_ref(compute).get(usize::from(slot)) {
                     Some(&Root::View(address)) => Some(address),
                     _ => {

@@ -34,6 +34,8 @@ mod indirect;
 #[cfg(windows)]
 mod inplace;
 pub mod list;
+#[cfg(windows)]
+mod loop_hits;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

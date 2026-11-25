@@ -88,6 +88,8 @@ mod diff_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod loop_hits_tests;
 mod lower;
 mod own_bits;
 mod rect;
@@ -113,8 +115,8 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_LOOP_HITS,
+    SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit,
 };
 
@@ -138,6 +140,24 @@ pub fn loop_limit() -> u32 {
         } else {
             lower::LOOP_LIMIT
         }
+    })
+}
+
+/// Whether translated loops count the lanes they stop at [`loop_limit`]:
+/// with the `diagnostics` feature, `VICTORY_LOOP_HITS=1`. Each wave whose
+/// lanes leave a loop at the limit adds their number to the dword the host
+/// binds at [`SLOT_LOOP_HITS`]; a loop that does not hit it costs one
+/// compare and branch per iteration more. Off, nothing changes. Part of the
+/// translation: the shader cache keys on it (`victory-gpu`'s does).
+pub fn loop_hits() -> bool {
+    #[cfg(test)]
+    if let Some(on) = lower::TEST_LOOP_HITS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics")
+            && std::env::var("VICTORY_LOOP_HITS").is_ok_and(|v| v.trim() == "1")
     })
 }
 

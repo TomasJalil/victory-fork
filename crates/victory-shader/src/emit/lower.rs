@@ -1007,6 +1007,8 @@ fn f16_nearest_on() -> bool {
 thread_local! {
     /// A test's choice for [`f16_nearest_on`], for its thread only.
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`super::loop_hits`], for its thread only.
+    pub(super) static TEST_LOOP_HITS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
@@ -10430,7 +10432,10 @@ impl<'a> Lower<'a> {
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
-                let ok = self.count_iteration(t, pred::IULT);
+                let (ok, hit) = self.count_iteration(t, pred::IULT);
+                if let Some(hit) = hit {
+                    self.count_hits(b, hit);
+                }
                 let abort = self.abort_block();
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
@@ -10467,15 +10472,23 @@ impl<'a> Lower<'a> {
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
-                let cond = if back(self, taken) {
-                    let ok = self.count_iteration(taken, pred::IULT);
-                    self.s.m.bin(self.cur, Bin::And, cond, ok)
+                let c = self.cur;
+                let (cond, hit) = if back(self, taken) {
+                    let (ok, hit) = self.count_iteration(taken, pred::IULT);
+                    // Stopped: would have gone round.
+                    let hit = hit.map(|h| self.s.m.bin(c, Bin::And, cond, h));
+                    (self.s.m.bin(c, Bin::And, cond, ok), hit)
                 } else if back(self, not_taken) {
-                    let stop = self.count_iteration(not_taken, pred::IUGE);
-                    self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                    let (stop, hit) = self.count_iteration(not_taken, pred::IUGE);
+                    let f = self.s.m.bool(false);
+                    let hit = hit.map(|h| self.s.m.select(c, cond, f, h));
+                    (self.s.m.bin(c, Bin::Or, cond, stop), hit)
                 } else {
-                    cond
+                    (cond, None)
                 };
+                if let Some(hit) = hit {
+                    self.count_hits(b, hit);
+                }
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
@@ -10519,8 +10532,9 @@ impl<'a> Lower<'a> {
 
     /// A back edge to header `to` (a back edge keeps its block, no
     /// critical-edge block): the count goes up; the result compares it with
-    /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
-    fn count_iteration(&mut self, to: usize, p: u8) -> V {
+    /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop). With
+    /// [`super::loop_hits`], also whether the count is at the limit.
+    fn count_iteration(&mut self, to: usize, p: u8) -> (V, Option<V>) {
         let c = self.cur;
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
@@ -10552,7 +10566,57 @@ impl<'a> Lower<'a> {
             .push((next, c));
         let over = self.s.m.cmp(c, p, next, limit);
         self.s.m.tag(over, Tag::Counter);
-        over
+        let hit = super::loop_hits().then(|| {
+            if p == pred::IUGE {
+                return over;
+            }
+            let hit = self.s.m.cmp(c, pred::IUGE, next, limit);
+            self.s.m.tag(hit, Tag::Counter);
+            hit
+        });
+        (over, hit)
+    }
+
+    /// With [`super::loop_hits`]: the lanes of the latch `self.cur` for which
+    /// `hit` holds (they leave the loop at the limit) add their number to
+    /// the host's dword, one atomic per wave. `self.cur` then becomes the
+    /// block after, which takes the latch's place as a predecessor.
+    fn count_hits(&mut self, b: usize, hit: V) {
+        let latch = self.cur;
+        let (count, add, rest) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(latch, Term::CondBr(hit, count, rest));
+        let i32t = self.s.t.i32;
+        self.s.flags |= flags::WAVE_OPS;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let t = self.s.m.bool(true);
+        let r = self.s.op(count, "waveActiveBallot", Attr::NoUnwind, four, 116, &[t]);
+        let (lo, hi) = (self.s.m.extract(count, r, 0), self.s.m.extract(count, r, 1));
+        // Countbits (dx.op 31) of both halves; FirstbitLo (32) picks the wave's first lane.
+        let nlo = self.s.op(count, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[lo]);
+        let nhi = self.s.op(count, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[hi]);
+        let n = self.s.m.bin(count, Bin::Add, nlo, nhi);
+        let flo = self.s.op(count, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[lo]);
+        let fhi = self.s.op(count, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[hi]);
+        let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+        let fhi = self.s.m.bin(count, Bin::Add, fhi, k32);
+        let in_lo = self.s.m.cmp(count, pred::NE, lo, z);
+        let first = self.s.m.select(count, in_lo, flo, fhi);
+        let me = self.s.op(count, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let leader = self.s.m.cmp(count, pred::EQ, me, first);
+        self.s.m.terminate(count, Term::CondBr(leader, add, rest));
+        let h = self.s.root_uav_handle(super::shader::SLOT_LOOP_HITS);
+        let (iu, code) = (self.s.m.undef(i32t), self.s.m.i32(0));
+        self.s.op(add, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, code, z, iu, iu, n]);
+        self.s.m.terminate(add, Term::Br(rest));
+        for (_, incoming) in self.counters.values_mut() {
+            for entry in incoming.iter_mut().filter(|e| e.1 == latch) {
+                entry.1 = rest;
+            }
+        }
+        if self.tail[b] == Some(latch) {
+            self.tail[b] = Some(rest);
+        }
+        self.cur = rest;
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
