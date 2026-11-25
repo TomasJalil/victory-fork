@@ -1442,11 +1442,15 @@ unsafe impl Send for CardWork {}
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
 /// The compare of a declared range of a copy in the card's memory with
-/// its bytes from before, one thread per 64 KiB piece (cut at multiples of
-/// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
-/// gets a dword per piece, 1 where a byte differs. The offsets are widened
-/// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
-/// byte just outside the range costs a fetch that finds nothing.
+/// its bytes from before, one group of 64 threads per 64 KiB piece (cut at
+/// multiples of 64 KiB of title memory, as `Shadow::card_piece` cuts them):
+/// each thread hashes a 1 KiB stripe of the piece and the first folds the
+/// 64 stripe hashes in order. One thread walking the whole piece took 4,096
+/// dependent steps, so every pass lasted as long as one piece's walk.
+/// `differs` gets a dword per piece, 1 where a byte differs. The offsets
+/// are widened to 16 bytes; buffers are multiples of 64 KiB, and a piece
+/// flagged for a byte just outside the range costs a fetch that finds
+/// nothing. Groups are laid out by [`dispatch_pieces`].
 pub(crate) const CARD_COMPARE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
@@ -1462,24 +1466,46 @@ ByteAddressBuffer now : register(t0);
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+groupshared uint4 stripe_hash[64];
+static const uint4 MUL = uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+static const uint4 SEED = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+uint4 mix(uint4 h, uint4 v) {
+    h = (h ^ v) * MUL;
+    return h.yzwx ^ (h >> 15);
+}
+// Where byte `at` of piece `piece` lies in the copy (0 before its start).
+uint copy_offset(uint piece, uint at) {
+    uint o = piece * 65536u + at;
+    return o > skew ? o - skew : 0u;
+}
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= pieces) return;
-    uint piece = first + id.x;
-    uint lo = piece * 65536u;
-    lo = lo > skew ? lo - skew : 0u;
-    uint hi = min((piece + 1u) * 65536u - skew, size);
-    lo = lo & ~15u;
-    hi = (hi + 15u) & ~15u;
-    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {
+    uint index = group.y * 65535u + group.x;
+    // The whole group leaves together, ahead of the barrier.
+    if (index >= pieces) return;
+    uint piece = first + index;
+    uint lo = copy_offset(piece, 0u) & ~15u;
+    uint hi = (min((piece + 1u) * 65536u - skew, size) + 15u) & ~15u;
+    // The lane's stripe; neighbours cut at the same rounded offset.
+    uint from = clamp(copy_offset(piece, lane * 1024u) & ~15u, lo, hi);
+    uint to = lane == 63u ? hi : clamp(copy_offset(piece, (lane + 1u) * 1024u) & ~15u, lo, hi);
+    uint4 h = SEED;
     [loop]
-    for (uint at = lo; at < hi; at += 16u) {
-        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
+    for (uint at = from; at < to; at += 16u) {
+        h = mix(h, now.Load4(at));
+    }
+    stripe_hash[lane] = h;
+    GroupMemoryBarrierWithGroupSync();
+    if (lane != 0u) return;
+    h = SEED;
+    // `[loop]`: FXC's `[unroll(n)]` caps the loop at n passes.
+    [loop]
+    for (uint i = 0u; i < 64u; i++) {
+        h = mix(h, stripe_hash[i]);
     }
     if (compare != 0u) {
-        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        differs.Store(out_at + index * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
         if (compare == 2u) hashes.Store4(piece * 16u, h);
@@ -1488,6 +1514,56 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 }
 "#;
+
+/// The most thread groups in one dimension of a dispatch.
+const MAX_GROUPS: u32 = 65_535;
+
+/// Dispatches [`CARD_COMPARE`] over `pieces` pieces: a group per piece, in
+/// rows of [`MAX_GROUPS`] (the shader numbers them `y * MAX_GROUPS + x`).
+///
+/// # Safety
+/// `list` is open, with the compare's pipeline and root arguments set.
+unsafe fn dispatch_pieces(list: &ID3D12GraphicsCommandList, pieces: u32) {
+    if pieces == 0 {
+        return;
+    }
+    let (x, y) = piece_groups(pieces);
+    // SAFETY: as the caller promises.
+    unsafe { list.Dispatch(x, y, 1) };
+}
+
+/// The group counts (x, y) for `pieces` pieces, a group each.
+pub(crate) fn piece_groups(pieces: u32) -> (u32, u32) {
+    (pieces.min(MAX_GROUPS), pieces.div_ceil(MAX_GROUPS))
+}
+
+#[cfg(test)]
+mod piece_group_tests {
+    use super::{MAX_GROUPS, landed_after, piece_groups};
+
+    /// A fetch on the relay's own queue counts the newest send of the
+    /// plans it lands, and nothing when there are none.
+    #[test]
+    fn a_fetch_counts_the_newest_landed_send() {
+        assert_eq!(landed_after([3, 9, 5]), 9);
+        assert_eq!(landed_after([]), 0);
+    }
+
+    /// Every piece gets a group, numbered `y * MAX_GROUPS + x`, in rows no
+    /// wider than a dispatch allows.
+    #[test]
+    fn a_group_per_piece_in_rows() {
+        assert_eq!(piece_groups(1), (1, 1));
+        assert_eq!(piece_groups(3), (3, 1));
+        assert_eq!(piece_groups(MAX_GROUPS), (MAX_GROUPS, 1));
+        assert_eq!(piece_groups(MAX_GROUPS + 1), (MAX_GROUPS, 2));
+        for pieces in [1, 64, 65, 1000, MAX_GROUPS, MAX_GROUPS + 7, 262_144] {
+            let (x, y) = piece_groups(pieces);
+            assert!(x <= MAX_GROUPS);
+            assert!(x * y >= pieces && x * (y - 1) < pieces, "{pieces}");
+        }
+    }
+}
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
@@ -1547,6 +1623,9 @@ struct CardPlan {
     /// The lists of ours the plan recorded (whether the compare, the
     /// list), given back by `Host::card_done`.
     lists: Vec<(bool, Prelude)>,
+    /// With [`relay`], the number its sends were taken under in
+    /// [`QUEUE_ORDER`]: once its submission has run, so have sends 1..it.
+    sent_as: u64,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -2329,6 +2408,35 @@ struct RelayFetch {
     sent: u64,
     /// Buffer, mapping, bytes.
     buffer: Option<(ID3D12Resource, usize, u64)>,
+    /// With [`fetch_queue`]: a copy queue of the relay's own, and `list`
+    /// is a copy list for it.
+    queue: Option<ID3D12CommandQueue>,
+}
+
+/// Whether the relay fetches card copies' pieces on a copy queue of its own
+/// (`VICTORY_FETCH_QUEUE=1`; off by default) instead of the host's queue.
+///
+/// On the host's queue the fetch of a landing went behind everything sent
+/// since the flights it lands: each fetch waited for whole later
+/// submissions of the title's work to run (about 30 ms each, 3.3 a frame,
+/// for some 29 MB each, a few ms of copying). On a queue of its own it runs
+/// at once. What it reads then: the landing flights have run, and with them
+/// sends 1..the highest number their plans were taken under, so that number
+/// is what the merge counts the fetch as having come after (`after`): sends
+/// past it are left out of the merge, as before, whether or not the card had
+/// them when it copied. A later flight may be writing a piece meanwhile; its
+/// own compare and landing come after and merge its final bytes, as with a
+/// fetch that brought a later flight's bytes on the one queue.
+fn fetch_queue() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FETCH_QUEUE").is_some_and(|v| v == "1"))
+}
+
+/// The number the merge of a fetch on the relay's own queue counts it as
+/// having come after ([`fetch_queue`]): the newest send of the landing
+/// plans, all of which the card has run.
+fn landed_after(sent_as: impl IntoIterator<Item = u64>) -> u64 {
+    sent_as.into_iter().max().unwrap_or(0)
 }
 
 /// The thread that lands flights ([`relay`]): as soon as the card has run
@@ -3077,7 +3185,7 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            dispatch_pieces(list, run.pieces);
                         }
                     }
                     list.Close()?;
@@ -3096,6 +3204,7 @@ impl Host {
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
+            sent_as,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -3162,7 +3271,7 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        dispatch_pieces(list, r.span.pieces);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
@@ -3212,7 +3321,17 @@ impl Host {
 
     /// The relay's own list, fence, event for [`Host::relay_card_back`].
     fn make_relay_fetch(&self) -> Option<RelayFetch> {
-        let list = self.make_prelude()?;
+        let (list, queue) = if fetch_queue() {
+            match self.make_copy_queue() {
+                Ok((list, queue)) => (list, Some(queue)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no copy queue for the relay's fetches: the host's queue is used (VICTORY_FETCH_QUEUE=1)");
+                    (self.make_prelude()?, None)
+                }
+            }
+        } else {
+            (self.make_prelude()?, None)
+        };
         // SAFETY: plain objects of our own.
         unsafe {
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
@@ -3223,7 +3342,24 @@ impl Host {
                 event,
                 sent: 0,
                 buffer: None,
+                queue,
             })
+        }
+    }
+
+    /// A copy queue, with an allocator and a closed copy list for it
+    /// ([`fetch_queue`]).
+    fn make_copy_queue(&self) -> windows::core::Result<(Prelude, ID3D12CommandQueue)> {
+        // SAFETY: plain object creation.
+        unsafe {
+            let queue: ID3D12CommandQueue = self.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                ..Default::default()
+            })?;
+            let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+            let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+            list.Close()?;
+            Ok(((allocator, list), queue))
         }
     }
 
@@ -3279,8 +3415,16 @@ impl Host {
             }
         }
         if pieces.is_empty() {
-            // Nothing to fetch: every send so far is older than the next fetch.
-            crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
+            // Nothing to fetch: every send so far is older than the next
+            // fetch. On the relay's own queue a later fetch counts only the
+            // sends of the flights it lands (`fetch_queue`), so no more is
+            // given up than those.
+            let older = if fetch_queue() {
+                landed_after(plans.iter().map(|p| p.sent_as))
+            } else {
+                *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner())
+            };
+            crate::shadow::relay_fetched(older);
             return;
         }
         if fetch.is_none() {
@@ -3298,6 +3442,8 @@ impl Host {
         };
         f.sent += 1;
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
+        let own_queue = f.queue.clone();
+        let landed = landed_after(plans.iter().map(|p| p.sent_as));
         let waiting = std::time::Instant::now();
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
@@ -3311,14 +3457,27 @@ impl Host {
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
-                // In the order of the queue: the sends of title bytes so
-                // far are ahead of this fetch, every later one behind it.
-                let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                self.queue.ExecuteCommandLists(&lists);
-                let after = *order;
-                drop(order);
-                self.card_sent();
-                self.queue.Signal(&fence, sent)?;
+                let after = match &own_queue {
+                    // On a queue of its own the fetch runs at once, behind
+                    // the landing flights' sends (`fetch_queue`).
+                    Some(queue) => {
+                        queue.ExecuteCommandLists(&lists);
+                        queue.Signal(&fence, sent)?;
+                        landed
+                    }
+                    None => {
+                        // In the order of the queue: the sends of title bytes
+                        // so far are ahead of this fetch, every later one
+                        // behind it.
+                        let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                        self.queue.ExecuteCommandLists(&lists);
+                        let after = *order;
+                        drop(order);
+                        self.card_sent();
+                        self.queue.Signal(&fence, sent)?;
+                        after
+                    }
+                };
                 fence.SetEventOnCompletion(sent, event)?;
                 WaitForSingleObject(event, INFINITE);
                 Ok(after)

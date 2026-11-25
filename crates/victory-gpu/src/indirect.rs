@@ -690,7 +690,8 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                let (x, y) = crate::host::piece_groups(PIECES);
+                warp.list.Dispatch(x, y, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -718,6 +719,17 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        // Each thread of a piece's group hashes its own 1 KiB stripe and
+        // the first folds all 64: a change in any stripe (the first, the
+        // second, past the eighth, the last) is flagged in its piece only.
+        for at in [2 * PIECE, 2 * PIECE + 1024, 2 * PIECE + 9 * 1024 + 3, 2 * PIECE + 33 * 1024 + 5, 3 * PIECE - 1] {
+            // SAFETY: inside the mapping.
+            unsafe { now_ptr.add(at).write_volatile(content[at] ^ 0x01) };
+            assert_eq!(run(&mut warp, 2), [0, 0, 1], "byte {at:#x}");
+            // SAFETY: as above.
+            unsafe { now_ptr.add(at).write_volatile(content[at]) };
+            assert_eq!(run(&mut warp, 2), [0, 0, 1], "byte {at:#x} back");
+        }
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
