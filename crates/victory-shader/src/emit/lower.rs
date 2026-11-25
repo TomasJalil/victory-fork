@@ -243,6 +243,9 @@ struct Lower<'a> {
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
+    /// With `split_lds`: whether the code emitted since the host waves last met in this IR
+    /// block may have read, written LDS (both at the start of a block: not known).
+    lds_since: (bool, bool),
     /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
@@ -1507,6 +1510,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             split_lds,
             lds_meet,
+            lds_since: (true, true),
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
             local_any: LOCAL_ANY.get(),
@@ -2088,8 +2092,11 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
+            // What came before this block is not known; after a meeting nothing has.
+            self.lds_since = (true, true);
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
                 self.lds_meeting();
+                self.lds_since = (false, false);
             }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
@@ -2098,6 +2105,7 @@ impl<'a> Lower<'a> {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
                     }
+                    self.lds_since = (true, true);
                     i = end;
                     continue;
                 }
@@ -4687,11 +4695,21 @@ impl<'a> Lower<'a> {
             && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
         {
             // the two host waves of a console wave meet before each LDS access: what the other
-            // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
-            let void = self.s.t.void;
-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            // half wrote is visible, and what it still reads is not overwritten. Not before a
+            // read when nothing since they last met in this block may have written LDS: the
+            // order of two reads cannot be seen, and any write after them meets first (both
+            // waves run the same barriers here, every lane runs the block).
+            let (read, wrote) = self.lds_since;
+            let needed = if name.starts_with("ds_read") { wrote } else { read || wrote };
+            if needed || super::group_sync() == 0 {
+                let mode = self.s.m.i32(meeting_mode());
+                let void = self.s.t.void;
+                self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                self.lds_since = (false, false);
+            }
         }
+        // What the instruction's code does to LDS (and memory through pointers), whatever it is.
+        let first_inst = self.s.m.inst_count();
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
@@ -4726,6 +4744,7 @@ impl<'a> Lower<'a> {
             // program where its results are needed, and two trace programs
             // came out without their test that way.
             Fields::Image { .. } if name.starts_with("image_bvh") => {
+                self.lds_since = (true, true);
                 return self
                     .bvh(inst, b, i)
                     .map_err(|why| unsupported(offset, why));
@@ -4737,6 +4756,9 @@ impl<'a> Lower<'a> {
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
             Fields::Flat { .. } => Err("flat memory"),
         };
+        let (read, wrote) = self.s.m.pointer_access_since(first_inst);
+        self.lds_since.0 |= read;
+        self.lds_since.1 |= wrote;
         match r {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
@@ -11475,6 +11497,65 @@ mod tests {
             assert_eq!(calls_of(&l.calls, "rawBufferStore").len(), lookups);
             assert_eq!(calls_of(&l.calls, "rawBufferLoad").len(), 2 * lookups);
         }
+    }
+
+    /// Group barriers in the lowering of `body` as a console wave64 program of 64 threads
+    /// with LDS on a host of 32-lane waves (two host waves that meet around LDS accesses).
+    fn split_wave_barriers(body: &[u32]) -> usize {
+        let code: Vec<u8> = body
+            .iter()
+            .chain(&[S_ENDPGM])
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15,
+                threads: [64, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, true, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let was = super::TEST_HOST_WAVE.replace(Some(32));
+        let l = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        });
+        super::TEST_HOST_WAVE.set(was);
+        let l = l.unwrap();
+        assert_eq!(l.wave_size, Some(32), "two host waves");
+        l.calls.iter().flatten().filter(|c| c.starts_with("barrier")).count()
+    }
+
+    #[test]
+    fn split_wave_lds_reads_in_a_row_share_one_meeting() {
+        const WRITE: [u32; 2] = [0xD834_0000, 0x0000_0000]; // ds_write_b32 v0, v0
+        const READ1: [u32; 2] = [0xD8D8_0000, 0x0100_0000]; // ds_read_b32 v1, v0
+        const READ2: [u32; 2] = [0xD8D8_0004, 0x0200_0000]; // ds_read_b32 v2, v0 offset:4
+        const WRITE1: [u32; 2] = [0xD834_0008, 0x0000_0100]; // ds_write_b32 v0, v1 offset:8
+        let program = |parts: &[[u32; 2]]| split_wave_barriers(&parts.concat());
+        let one_read = program(&[WRITE, READ1, WRITE1]);
+        // A read after a read: no write between them for the other half to see, and the
+        // write after them waits for both.
+        assert_eq!(program(&[WRITE, READ1, READ2, WRITE1]), one_read);
+        // A read after a write: they meet.
+        assert_eq!(program(&[WRITE, READ1, WRITE1, READ2]), one_read + 1);
+        // A write after a write too.
+        assert_eq!(program(&[WRITE, READ1, WRITE1, WRITE1]), one_read + 1);
     }
 
     #[test]
