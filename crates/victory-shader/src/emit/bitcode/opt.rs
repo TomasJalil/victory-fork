@@ -1,8 +1,8 @@
 //! Clean-up of a finished module before it is written: the lowering emits
 //! one instruction after another as the console code names them, and
-//! nothing stands between it and the driver's compiler. Every pass here is
-//! exact: the module computes the same values and has the same effects for
-//! every input.
+//! nothing stands between it and the driver's compiler. Every pass that
+//! runs unasked is exact: the module computes the same values and has the
+//! same effects for every input.
 //!
 //! - [`DEAD`]: instructions without an effect whose result nothing reads
 //!   are left out (the lowering computes every dword of every register a
@@ -26,6 +26,9 @@
 //!   with an effect stands between them (another thread's unsynchronised
 //!   store may fall between any two reads or before both: the title's code
 //!   cannot tell which).
+//! - [`SRV`], only when asked for: a read through an SRV is reused across
+//!   blocks and stores (exact only while nothing writes the bytes behind
+//!   the SRV during the draw; see there).
 //!
 //! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
 //! the translation and so of the shader cache's key.
@@ -52,10 +55,20 @@ pub const LOADS: u32 = 16;
 /// half has a lane where every lane is in EXEC (`lower.rs`,
 /// `v_readfirstlane_b32`).
 pub const FIRST: u32 = 32;
+/// Not in [`ALL`], run only when asked for: a read through a view without
+/// the UAV bit (an SRV) that does not depend on other lanes (no
+/// derivatives) gives the result of the same read earlier on every path to
+/// it, across blocks and stores. Exact as long as nothing writes the memory
+/// behind an SRV while the draw or dispatch runs; the host does not promise
+/// that where a UAV of the same shader (title memory by address) and an SRV
+/// view the same bytes, so it stays a switch.
+pub const SRV: u32 = 64;
 /// The passes over the module.
-pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
-/// Every pass.
-pub const ALL: u32 = MODULE | FIRST;
+pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | SRV;
+/// Every pass that runs without being asked for.
+pub const ALL: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | FIRST;
+/// Every pass there is.
+pub const ANY: u32 = ALL | SRV;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
@@ -215,7 +228,7 @@ pub(super) fn effect(f: &Func) -> Effect {
 impl Module {
     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
-        if passes & (FOLD | REUSE | FACTS | LOADS) != 0 {
+        if passes & (FOLD | REUSE | FACTS | LOADS | SRV) != 0 {
             // Values merged in one round can make two joins the same in
             // the next (a loop's registers that only go round), and a
             // branch that goes one way leaves blocks with one way in.
@@ -805,6 +818,23 @@ impl Module {
                     continue;
                 }
                 let class = self.class(&effects, i);
+                // An SRV read: as a value without an effect, whatever is
+                // stored between (the earlier read on every path to it).
+                if passes & SRV != 0
+                    && class == Effect::Reads
+                    && self.fixed_read(i)
+                    && let Some(key) = self.key(i)
+                {
+                    if let Some(&first) = known.get(&key) {
+                        repl[i as usize] = Some(first);
+                        changed = true;
+                        continue;
+                    }
+                    known.insert(key.clone(), V::Inst(i));
+                    added.push(key);
+                    kept.push(i);
+                    continue;
+                }
                 if passes & REUSE != 0
                     && class == Effect::Pure
                     && let Some(key) = self.key(i)
@@ -963,35 +993,67 @@ impl Module {
         self.drop_unused_tables();
     }
 
+    /// The fields of the annotation of handle `h`, if it is an
+    /// `annotateHandle`: the first its kind, with the UAV bit (0x1000); the
+    /// second the component type and count.
+    fn annotation(&self, h: V) -> Option<(i64, i64)> {
+        let V::Inst(a) = h else { return None };
+        let Op::Call(f, args) = &self.insts[a as usize].op else {
+            return None;
+        };
+        if self.funcs[*f as usize].name != "dx.op.annotateHandle" {
+            return None;
+        }
+        let V::Const(props) = *args.get(2)? else {
+            return None;
+        };
+        let Const::Aggregate(fields) = &self.consts[props as usize].1 else {
+            return None;
+        };
+        match (
+            &self.consts[fields[0] as usize].1,
+            &self.consts[fields[1] as usize].1,
+        ) {
+            (Const::Int(kind), Const::Int(components)) => Some((*kind, *components)),
+            _ => None,
+        }
+    }
+
+    /// [`SRV`]: instruction `i` reads through a view without the UAV bit
+    /// and without derivatives (a buffer or texture load, a sample at a
+    /// given level or gradient, a gather), so it gives the same result
+    /// wherever it runs in the shader.
+    fn fixed_read(&self, i: u32) -> bool {
+        let Op::Call(f, args) = &self.insts[i as usize].op else {
+            return false;
+        };
+        let name = self.funcs[*f as usize].name.as_str();
+        let name = name.strip_prefix("dx.op.").unwrap_or(name);
+        let class = name.split('.').next().unwrap_or(name);
+        matches!(
+            class,
+            "rawBufferLoad"
+                | "bufferLoad"
+                | "textureLoad"
+                | "sampleLevel"
+                | "sampleGrad"
+                | "sampleCmpLevelZero"
+                | "sampleCmpLevel"
+                | "sampleCmpGrad"
+                | "textureGather"
+                | "textureGatherCmp"
+        ) && args
+            .get(1)
+            .and_then(|&h| self.annotation(h))
+            .is_some_and(|(kind, _)| kind & 0x1000 == 0)
+    }
+
     /// See [`Usage`]: over the blocks reached from the entry.
     pub(crate) fn usage(&self) -> Usage {
         let mut u = Usage::default();
         let reached = self.reached();
         let wide = |ty: Ty| self.types[ty.0 as usize] == TypeDef::Int(64);
-        // The first field of a handle's annotation: its kind, with the UAV
-        // bit; the second: the component type and count.
-        let annotation = |h: V| -> Option<(i64, i64)> {
-            let V::Inst(a) = h else { return None };
-            let Op::Call(f, args) = &self.insts[a as usize].op else {
-                return None;
-            };
-            if self.funcs[*f as usize].name != "dx.op.annotateHandle" {
-                return None;
-            }
-            let V::Const(props) = *args.get(2)? else {
-                return None;
-            };
-            let Const::Aggregate(fields) = &self.consts[props as usize].1 else {
-                return None;
-            };
-            match (
-                &self.consts[fields[0] as usize].1,
-                &self.consts[fields[1] as usize].1,
-            ) {
-                (Const::Int(kind), Const::Int(components)) => Some((*kind, *components)),
-                _ => None,
-            }
-        };
+        let annotation = |h: V| self.annotation(h);
         for (_, blk) in self.blocks.iter().enumerate().filter(|(b, _)| reached[*b]) {
             for &i in blk.phis.iter().chain(&blk.body) {
                 let inst = &self.insts[i as usize];
@@ -1587,6 +1649,58 @@ mod tests {
             [vec![below, below], vec![top, top]]
         );
         m.write();
+    }
+
+    #[test]
+    fn an_srv_read_is_reused_across_blocks_and_stores_only_when_asked() {
+        for srv_pass in [false, true] {
+            let Diamond {
+                k: Kit {
+                    mut m, b, writes, ..
+                },
+                then,
+                ..
+            } = diamond();
+            let i32t = m.int(32);
+            let props = m.named_struct("dx.types.ResourceProperties", vec![i32t, i32t]);
+            let aty = m.func_ty(i32t, vec![i32t, i32t, props]);
+            m.ptr(aty);
+            let annotate = m.function("dx.op.annotateHandle", aty, Some(Attr::ReadNone), false);
+            let lty = m.func_ty(i32t, vec![i32t, i32t, i32t]);
+            m.ptr(lty);
+            let load = m.function("dx.op.rawBufferLoad.i32", lty, Some(Attr::ReadOnly), false);
+            let (op216, op139) = (m.i32(216), m.i32(139));
+            let (one, two, five) = (m.i32(1), m.i32(2), m.i32(5));
+            let handle = |m: &mut Module, from: V, kind: u32| {
+                let fields = [m.i32(kind), m.i32(0)];
+                let p = m.aggregate(props, &fields);
+                m.call(b, annotate, vec![op216, from, p])
+            };
+            // An SRV and a UAV, each read in the entry, again after a
+            // store there, and again in a block below it.
+            let srv = handle(&mut m, one, 11);
+            let uav = handle(&mut m, two, 11 | 0x1000);
+            let x = m.call(b, load, vec![op139, srv, five]);
+            let y = m.call(b, load, vec![op139, uav, five]);
+            m.call(b, writes, vec![x, y]);
+            let after = m.call(b, load, vec![op139, srv, five]);
+            let uav_after = m.call(b, load, vec![op139, uav, five]);
+            m.call(b, writes, vec![after, uav_after]);
+            let x2 = m.call(then, load, vec![op139, srv, five]);
+            let y2 = m.call(then, load, vec![op139, uav, five]);
+            m.call(then, writes, vec![x2, y2]);
+            m.optimise(REUSE | LOADS | if srv_pass { SRV } else { 0 });
+            let entry = stores(&m, b);
+            if srv_pass {
+                assert_eq!(entry[1], [x, uav_after], "the SRV's read after the store is the first");
+                assert_eq!(stores(&m, then), [[x, y2]], "and below it");
+            } else {
+                assert_eq!(entry[1], [after, uav_after]);
+                assert_eq!(stores(&m, then), [[x2, y2]]);
+            }
+            assert_eq!(ALL & SRV, 0, "not run unasked");
+            m.write();
+        }
     }
 
     #[test]
