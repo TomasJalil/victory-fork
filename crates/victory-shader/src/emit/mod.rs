@@ -199,7 +199,10 @@ pub fn group_sync() -> u8 {
 ///   and identities, 4 one instruction for one value, 8 what a branch taken
 ///   says about its condition, 16 one read for one place within a block,
 ///   32 a first-lane read of two host waves without the round that asks
-///   which half has a lane (where every lane has one).
+///   which half has a lane (where every lane has one), 64 one read through
+///   an SRV for one place across blocks and stores (not exact where the
+///   host lets a UAV write the bytes an SRV reads in the same draw; never
+///   on unless named: `0x7f` is every pass with it).
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
@@ -208,8 +211,8 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
-/// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
-/// unreadable. Pure, for testing.
+/// `VICTORY_SHADER_OPT`'s value; every pass but [`bitcode::opt::SRV`] when
+/// it is unset or unreadable. Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {
     let parsed = value
         .map(str::trim)
@@ -217,7 +220,7 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
         });
-    parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
+    parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ANY)
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -787,8 +790,12 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), all);
+        // The SRV pass only when named.
+        let srv = super::bitcode::opt::SRV;
+        assert_eq!(all & srv, 0);
+        assert_eq!(parse_shader_opt(Some("0x7f")), all | srv);
+        assert_eq!(parse_shader_opt(Some("0xffffffff")), all | srv);
     }
 
     #[test]

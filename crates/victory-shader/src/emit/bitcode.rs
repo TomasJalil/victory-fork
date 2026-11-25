@@ -382,6 +382,26 @@ impl Module {
         }
     }
 
+    /// The number of instructions made so far (the next one's number).
+    pub fn inst_count(&self) -> usize {
+        self.insts.len()
+    }
+
+    /// Whether the instructions made from number `first` on read, write
+    /// memory through a pointer (shared memory, constant tables): loads;
+    /// stores and atomics.
+    pub fn pointer_access_since(&self, first: usize) -> (bool, bool) {
+        let (mut read, mut wrote) = (false, false);
+        for inst in &self.insts[first.min(self.insts.len())..] {
+            match inst.op {
+                Op::Load(_) => read = true,
+                Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => wrote = true,
+                _ => {}
+            }
+        }
+        (read, wrote)
+    }
+
     pub fn new_block(&mut self) -> usize {
         self.blocks.push(Block::default());
         self.blocks.len() - 1

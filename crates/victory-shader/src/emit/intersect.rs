@@ -244,7 +244,9 @@ impl<'a> Lower<'a> {
             let at = self.s.m.select(c, inside, at, outside);
             return (handle, at);
         }
-        self.memory(low, high, guard)
+        // Without the branch: the callers keep emitting into the block they
+        // started in, and join their own blocks by name.
+        self.memory(low, high, guard, false)
     }
 
     /// `count` dwords of the node from its byte `base` + `offset` (`base`
